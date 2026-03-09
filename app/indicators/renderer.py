@@ -38,6 +38,18 @@ class IndicatorRenderer:
         self._times_cache: Optional[np.ndarray] = None
         self._series_cache: Dict[Tuple[str, str], Dict[str, np.ndarray]] = {}
         self._max_points = 1500
+        self._band_fill_enabled = True
+
+    def set_max_points(self, n: int) -> None:
+        # Used by ChartView to reduce draw cost when zoomed out.
+        try:
+            n = int(n)
+        except Exception:
+            return
+        self._max_points = max(50, n)
+
+    def set_band_fill_enabled(self, enabled: bool) -> None:
+        self._band_fill_enabled = bool(enabled)
 
     def _downsample(self, times: np.ndarray, values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         if times.size <= self._max_points:
@@ -102,7 +114,10 @@ class IndicatorRenderer:
         if isinstance(bars, np.ndarray):
             times = np.asarray(bars[:, 0], dtype=np.float64)
         else:
-            times = np.asarray([float(b[0]) for b in bars], dtype=np.float64)
+            try:
+                times = np.fromiter((float(b[0]) for b in bars), dtype=np.float64, count=len(bars))
+            except Exception:
+                times = np.asarray([float(b[0]) for b in bars], dtype=np.float64)
         if times.size == 0:
             return times
         key = (int(times.size), float(times[0]), float(times[-1]))
@@ -185,7 +200,7 @@ class IndicatorRenderer:
             cache["lower"] = lower
         edge_color = _color(spec.get("edge_color", "#8A8F9B"))
         edge_width = int(spec.get("edge_width", 1))
-        fill = spec.get("fill")
+        fill = spec.get("fill") if self._band_fill_enabled else None
 
         upper_key = ("band_upper", band_id)
         lower_key = ("band_lower", band_id)

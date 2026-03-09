@@ -176,8 +176,10 @@ class IndicatorComputeWorker(QThread):
                     "merge": bool(task.get("merge")),
                     "tail_len": int(task.get("tail_len") or 0),
                     "bars_key": task.get("bars_key"),
+                    "full_length": task.get("full_length"),
                     "compute_start_idx": task.get("compute_start_idx"),
                     "compute_end_idx": task.get("compute_end_idx"),
+                    "preview": bool(task.get("preview")),
                     "reason": self._reason,
                 })
         except Exception as exc:
@@ -719,6 +721,9 @@ class ChartView(QWidget):
         self._indicator_times_cache: Dict[tuple, np.ndarray] = {}
         self._last_indicator_view_idx_key: Optional[Tuple[Optional[int], Optional[int]]] = None
         self._indicator_freeze_visible_bars = 1500
+        # At very large visible spans, do downsampled "preview" recompute instead of full-res.
+        self._indicator_preview_visible_bars = 5000
+        self._indicator_preview_target_points = 2000
         self._indicator_idle_ms = 200
         self._indicator_idle_timer = QTimer(self)
         self._indicator_idle_timer.setSingleShot(True)
@@ -750,6 +755,7 @@ class ChartView(QWidget):
         self._active_strategy_report = None
         self._strategy_finish_in_progress = False
         self._last_visible_bars = 0
+        self._indicator_preview_pending = False
 
         # Rolling perf window (event-based) for debug dock budgeting.
         self._perf_window_s = 5.0
@@ -841,11 +847,14 @@ class ChartView(QWidget):
             bars_key = result.get("bars_key")
             compute_start = result.get("compute_start_idx")
             compute_end = result.get("compute_end_idx")
+            full_length = result.get("full_length")
+            is_preview = bool(result.get("preview"))
             instance = self._find_indicator_instance(instance_id)
             if instance is None:
                 continue
             instance["required_lookback"] = result.get("required", 0)
-            instance["last_view_key"] = view_key
+            if not is_preview:
+                instance["last_view_key"] = view_key
             instance["last_view_idx_key"] = view_idx_key
             if merge:
                 prev = self._indicator_last_output.get(instance_id)
@@ -853,26 +862,18 @@ class ChartView(QWidget):
                 if tail_len > 0:
                     output = dict(output)
                     output["_tail_len"] = tail_len
-            if bars_key and compute_start is not None and compute_end is not None:
-                cache = self._ensure_indicator_cache(instance_id, bars_key, len(bars))
-                self._apply_output_to_cache(cache, output, compute_start, compute_end)
-            elif bars_key:
-                self._ensure_indicator_cache(instance_id, bars_key, len(bars))
-            self._indicator_last_output[instance_id] = output
+            if not is_preview:
+                if bars_key and compute_start is not None and compute_end is not None:
+                    cache_len = int(full_length) if full_length is not None else len(getattr(self.candles, "candles", []))
+                    cache = self._ensure_indicator_cache(instance_id, bars_key, cache_len)
+                    self._apply_output_to_cache(cache, output, compute_start, compute_end)
+                elif bars_key:
+                    cache_len = int(full_length) if full_length is not None else len(getattr(self.candles, "candles", []))
+                    self._ensure_indicator_cache(instance_id, bars_key, cache_len)
+                self._indicator_last_output[instance_id] = output
             renderer = self._indicator_renderers.get(pane_id)
             if renderer:
-                times = None
-                if view_key is not None:
-                    cached = self._indicator_times_cache.get(view_key)
-                    if cached is not None and cached.size == len(bars):
-                        times = cached
-                if times is None:
-                    try:
-                        times = np.asarray([float(b[0]) for b in bars], dtype=np.float64)
-                    except Exception:
-                        times = None
-                    if times is not None and view_key is not None:
-                        self._indicator_times_cache[view_key] = times
+                times = self._get_times_cached(view_key, bars)
                 if times is not None:
                     renderer.render((bars, times), output or {}, namespace=instance_id)
                 else:
@@ -881,7 +882,12 @@ class ChartView(QWidget):
     def _on_indicator_compute_finished(self) -> None:
         if self._indicator_compute_pending:
             self._indicator_compute_pending = False
-            self._recompute_indicators(immediate=True, reason="view")
+            if int(self._last_visible_bars or 0) >= self._indicator_preview_visible_bars:
+                if not self._indicator_preview_pending:
+                    self._indicator_preview_pending = True
+                    QTimer.singleShot(0, self._do_recompute_indicators_preview)
+            else:
+                self._recompute_indicators(immediate=True, reason="view")
 
     def _merge_indicator_output(self, prev: Optional[Dict[str, Any]], new: Dict[str, Any], tail_len: int) -> Dict[str, Any]:
         if not prev or tail_len <= 0:
@@ -1771,6 +1777,41 @@ class ChartView(QWidget):
         else:
             self._indicator_recompute_timer.start(self._indicator_recompute_debounce_ms)
 
+    def _get_times_cached(self, key: Optional[tuple], bars: list) -> Optional[np.ndarray]:
+        if key is None or not bars:
+            return None
+        cached = self._indicator_times_cache.get(key)
+        if cached is not None and cached.size == len(bars):
+            return cached
+        try:
+            times = np.fromiter((float(b[0]) for b in bars), dtype=np.float64, count=len(bars))
+        except Exception:
+            try:
+                times = np.asarray([float(b[0]) for b in bars], dtype=np.float64)
+            except Exception:
+                return None
+        self._indicator_times_cache[key] = times
+        return times
+
+    def _update_indicator_renderer_lod(self) -> None:
+        # Reduce draw cost as visible bars increases.
+        vb = int(self._last_visible_bars or 0)
+        if vb >= self._indicator_preview_visible_bars:
+            max_points = 650
+            band_fill = False
+        elif vb >= 2000:
+            max_points = 1000
+            band_fill = True
+        else:
+            max_points = 1500
+            band_fill = True
+        for renderer in self._indicator_renderers.values():
+            try:
+                renderer.set_max_points(max_points)
+                renderer.set_band_fill_enabled(band_fill)
+            except Exception:
+                pass
+
     def _do_recompute_indicators(self, force: bool = False) -> None:
         self._indicator_recompute_pending = False
         if self._initial_load_pending:
@@ -1820,11 +1861,14 @@ class ChartView(QWidget):
                         renderer = self._indicator_renderers.get(instance.get("pane_id", "price"))
                         if renderer and view_bars:
                             try:
-                                times = np.asarray([float(b[0]) for b in view_bars], dtype=np.float64)
+                                times = self._get_times_cached(view_key, view_bars)
                                 cached_output = self._build_output_from_cache(cache, view_start_idx, view_end_idx)
                                 if cached_output:
                                     self._indicator_last_output[instance_id] = cached_output
-                                    renderer.render((view_bars, times), cached_output, namespace=str(instance.get("instance_id")))
+                                    if times is not None:
+                                        renderer.render((view_bars, times), cached_output, namespace=str(instance.get("instance_id")))
+                                    else:
+                                        renderer.render(view_bars, cached_output, namespace=str(instance.get("instance_id")))
                             except Exception:
                                 pass
                         continue
@@ -1868,6 +1912,7 @@ class ChartView(QWidget):
                 "params": params,
                 "compute_bars": slice_bars,
                 "render_bars": render_bars,
+                "full_length": len(bars),
                 "pane_id": instance.get("pane_id", "price"),
                 "view_key": view_key,
                 "view_idx_key": view_idx_key,
@@ -1884,6 +1929,70 @@ class ChartView(QWidget):
             self._indicator_compute_pending = True
             return
         self._start_indicator_compute_worker(tasks, reason=reason)
+
+    def _do_recompute_indicators_preview(self) -> None:
+        # Zoomed-out preview: downsample compute bars and render quickly without updating full-res caches.
+        self._indicator_preview_pending = False
+        if self._initial_load_pending:
+            return
+        bars = getattr(self.candles, "candles", [])
+        if not bars:
+            return
+        try:
+            bars_key = (len(bars), float(bars[0][0]), float(bars[-1][0]))
+        except Exception:
+            bars_key = None
+        view_start_idx, view_end_idx = self.candles.get_view_index_range(margin=10)
+        if view_start_idx is None or view_end_idx is None or view_end_idx <= view_start_idx:
+            return
+        visible_count = max(0, int(view_end_idx - view_start_idx))
+        if visible_count <= 0:
+            return
+        step = max(1, int(np.ceil(visible_count / float(self._indicator_preview_target_points))))
+        tasks = []
+        for instance in self._indicator_instances:
+            if not instance.get("visible", True):
+                continue
+            info = instance.get("info")
+            if info is None:
+                continue
+            compute_fn = getattr(info.module, "compute", None)
+            if compute_fn is None:
+                continue
+            instance_id = str(instance.get("instance_id"))
+            required = int(instance.get("required_lookback", 0) or 0)
+            preview_start = max(0, int(view_start_idx) - required)
+            preview_end = int(view_end_idx)
+            preview_bars = bars[preview_start:preview_end:step]
+            if not preview_bars:
+                continue
+            try:
+                preview_view_key = (len(preview_bars), float(preview_bars[0][0]), float(preview_bars[-1][0]))
+            except Exception:
+                preview_view_key = None
+            preview_key = (bars_key, int(view_start_idx), int(view_end_idx), int(step), int(required))
+            if instance.get("last_preview_key") == preview_key:
+                continue
+            instance["last_preview_key"] = preview_key
+            tasks.append({
+                "instance_id": instance_id,
+                "compute_fn": compute_fn,
+                "params": instance.get("params", {}),
+                "compute_bars": preview_bars,
+                "render_bars": preview_bars,
+                "full_length": len(bars),
+                "pane_id": instance.get("pane_id", "price"),
+                "view_key": preview_view_key,
+                "view_idx_key": (view_start_idx, view_end_idx),
+                "bars_key": bars_key,
+                "preview": True,
+            })
+        if not tasks:
+            return
+        if self._indicator_compute_worker and self._indicator_compute_worker.isRunning():
+            self._indicator_compute_pending = True
+            return
+        self._start_indicator_compute_worker(tasks, reason="preview")
 
 
     def _load_symbols(self) -> None:
@@ -2633,6 +2742,7 @@ class ChartView(QWidget):
         span = x_max - x_min
         span_bars = span / tf_ms if tf_ms > 0 else span
         self._last_visible_bars = int(span_bars) if span_bars is not None else 0
+        self._update_indicator_renderer_lod()
         try:
             if span_bars and span_bars >= self._indicator_freeze_visible_bars:
                 self.candles.set_volume_live_updates_enabled(False)
@@ -2661,6 +2771,12 @@ class ChartView(QWidget):
         self._recompute_indicators(immediate=False, reason="view")
 
     def _on_indicator_idle(self) -> None:
+        # When zoomed out heavily, do a cheap preview compute instead of a full forced recompute.
+        if int(self._last_visible_bars or 0) >= self._indicator_preview_visible_bars:
+            if not self._indicator_preview_pending:
+                self._indicator_preview_pending = True
+                QTimer.singleShot(0, self._do_recompute_indicators_preview)
+            return
         self._do_recompute_indicators(force=True)
 
     def _on_view_idle(self) -> None:

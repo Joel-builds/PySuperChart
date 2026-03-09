@@ -31,7 +31,8 @@ class VolumeHistogramItem(pg.GraphicsObject):
         self._is_up: Optional[np.ndarray] = None
         self._ts_cache: List[float] = []
         self._chunk_cache: dict[int, QPicture] = {}
-        self._render_key: Optional[Tuple[int, float, float, float]] = None
+        # Cache key for chunk QPictures. Must stay stable across y-range changes.
+        self._render_key: Optional[Tuple[int, float, float, int]] = None
         self._view_hint: Optional[Tuple[int, int, int]] = None
         self._view_hint_key: Optional[Tuple[float, float, int]] = None
         self._cached_bounds: Optional[QRectF] = None
@@ -197,18 +198,44 @@ class VolumeHistogramItem(pg.GraphicsObject):
     def paint(self, painter: QPainter, option, widget) -> None:
         if self._x is None or self._vol is None or self._x.size == 0:
             return
+        x_min = x_max = y_min = y_max = None
         try:
-            view_box = self.getViewBox()
-            if view_box:
-                (x_range, y_range) = view_box.viewRange()
-                x_min, x_max = x_range
-                y_min, y_max = y_range
-            else:
+            exposed = getattr(option, "exposedRect", None)
+            if exposed is not None and exposed.isValid() and exposed.width() > 0 and exposed.height() > 0:
+                x_min, x_max = float(exposed.left()), float(exposed.right())
+                y_min, y_max = float(exposed.top()), float(exposed.bottom())
+        except Exception:
+            x_min = x_max = y_min = y_max = None
+        if x_min is None or x_max is None or y_min is None or y_max is None:
+            try:
+                rect = self._cached_bounds
+                if rect is not None and rect.isValid() and rect.width() > 0 and rect.height() > 0:
+                    x_min, x_max = float(rect.left()), float(rect.right())
+                    y_min, y_max = float(rect.top()), float(rect.bottom())
+            except Exception:
+                x_min = x_max = y_min = y_max = None
+        if x_min is None or x_max is None or y_min is None or y_max is None:
+            try:
+                view_box = self.getViewBox()
+                if view_box:
+                    (x_range, y_range) = view_box.viewRange()
+                    x_min, x_max = x_range
+                    y_min, y_max = y_range
+                else:
+                    x_min, x_max = self._x[0], self._x[-1]
+                    y_min, y_max = 0.0, 1.0
+            except Exception:
                 x_min, x_max = self._x[0], self._x[-1]
                 y_min, y_max = 0.0, 1.0
+        try:
+            x_min = float(x_min)
+            x_max = float(x_max)
+            y_min = float(y_min)
+            y_max = float(y_max)
         except Exception:
-            x_min, x_max = self._x[0], self._x[-1]
-            y_min, y_max = 0.0, 1.0
+            return
+        if y_max < y_min:
+            y_min, y_max = y_max, y_min
         if x_max <= x_min:
             return
         if self._view_hint_key == (float(x_min), float(x_max), int(self._data_len)) and self._view_hint is not None:
@@ -232,58 +259,70 @@ class VolumeHistogramItem(pg.GraphicsObject):
         visible_range = max(1e-9, float(y_max - y_min))
         volume_max_height = visible_range * self._volume_height_ratio
         volume_bottom = y_min
-        render_key = (step, float(volume_bottom), float(volume_max), float(self._bar_width))
+        # Key excludes y-range so chunk cache does not thrash on y-scale changes.
+        render_key = (int(step), float(volume_max), float(self._bar_width), int(self._data_len))
         if render_key != self._render_key:
             self._chunk_cache = {}
             self._render_key = render_key
-        min_height = max(visible_range * 0.001, 1e-6)
+        if volume_max_height <= 0:
+            return
+        # Keep a minimum visible height, expressed in normalized units so it is y-range independent.
+        min_height_norm = max(0.001 / max(self._volume_height_ratio, 1e-9), 1e-6)
         chunk_start = start_idx // self._chunk_size
         chunk_end = (end_idx - 1) // self._chunk_size if end_idx > 0 else chunk_start
-        for chunk_idx in range(chunk_start, chunk_end + 1):
-            picture = self._chunk_cache.get(chunk_idx)
-            if picture is None:
-                picture = QPicture()
-                qp = QPainter(picture)
-                try:
-                    c_start = chunk_idx * self._chunk_size
-                    c_end = min(self._x.size, c_start + self._chunk_size)
-                    for idx in range(c_start, c_end):
-                        if idx < start_idx or idx >= end_idx:
-                            continue
-                        if step > 1 and (idx % step) != 0:
-                            continue
-                        if self._tail_enabled and self._tail_index is not None and idx == self._tail_index:
-                            continue
-                        vol = float(self._vol[idx])
-                        if not np.isfinite(vol) or vol <= 0:
-                            continue
-                        height = (vol / volume_max) * volume_max_height
-                        if height < min_height:
-                            height = min_height
+        painter.save()
+        try:
+            painter.translate(0.0, float(volume_bottom))
+            painter.scale(1.0, float(volume_max_height))
+            transparent_pen = pg.mkPen(QColor(0, 0, 0, 0))
+            for chunk_idx in range(chunk_start, chunk_end + 1):
+                picture = self._chunk_cache.get(chunk_idx)
+                if picture is None:
+                    picture = QPicture()
+                    qp = QPainter(picture)
+                    try:
+                        qp.setPen(transparent_pen)
+                        c_start = chunk_idx * self._chunk_size
+                        c_end = min(self._x.size, c_start + self._chunk_size)
+                        for idx in range(c_start, c_end):
+                            if idx < start_idx or idx >= end_idx:
+                                continue
+                            if step > 1 and (idx % step) != 0:
+                                continue
+                            if self._tail_enabled and self._tail_index is not None and idx == self._tail_index:
+                                continue
+                            vol = float(self._vol[idx])
+                            if not np.isfinite(vol) or vol <= 0:
+                                continue
+                            height_norm = vol / volume_max
+                            if height_norm < min_height_norm:
+                                height_norm = min_height_norm
+                            color = self._base_color
+                            if self._is_up is not None and idx < self._is_up.size:
+                                color = self._up_color if bool(self._is_up[idx]) else self._down_color
+                            qp.setBrush(color)
+                            x_val = float(self._x[idx])
+                            qp.drawRect(QRectF(x_val - self._bar_width / 2.0, 0.0, self._bar_width, height_norm))
+                    finally:
+                        qp.end()
+                    self._chunk_cache[chunk_idx] = picture
+                painter.drawPicture(0, 0, picture)
+
+            if self._tail_enabled and self._tail_x is not None and self._tail_vol is not None:
+                if x_min <= self._tail_x <= x_max:
+                    vol = float(self._tail_vol)
+                    if np.isfinite(vol) and vol > 0:
+                        height_norm = vol / volume_max
+                        if height_norm < min_height_norm:
+                            height_norm = min_height_norm
                         color = self._base_color
-                        if self._is_up is not None and idx < self._is_up.size:
-                            color = self._up_color if bool(self._is_up[idx]) else self._down_color
-                        qp.setPen(pg.mkPen(QColor(0, 0, 0, 0)))
-                        qp.setBrush(color)
-                        x_val = float(self._x[idx])
-                        qp.drawRect(QRectF(x_val - self._bar_width / 2.0, volume_bottom, self._bar_width, height))
-                finally:
-                    qp.end()
-                self._chunk_cache[chunk_idx] = picture
-            painter.drawPicture(0, 0, picture)
-        if self._tail_enabled and self._tail_x is not None and self._tail_vol is not None:
-            if x_min <= self._tail_x <= x_max:
-                vol = self._tail_vol
-                if np.isfinite(vol) and vol > 0:
-                    height = (vol / volume_max) * volume_max_height
-                    if height < min_height:
-                        height = min_height
-                    color = self._base_color
-                    if self._tail_is_up is not None:
-                        color = self._up_color if self._tail_is_up else self._down_color
-                    painter.setPen(pg.mkPen(QColor(0, 0, 0, 0)))
-                    painter.setBrush(color)
-                    painter.drawRect(QRectF(self._tail_x - self._bar_width / 2.0, volume_bottom, self._bar_width, height))
+                        if self._tail_is_up is not None:
+                            color = self._up_color if self._tail_is_up else self._down_color
+                        painter.setPen(transparent_pen)
+                        painter.setBrush(color)
+                        painter.drawRect(QRectF(self._tail_x - self._bar_width / 2.0, 0.0, self._bar_width, height_norm))
+        finally:
+            painter.restore()
 
 
 def update_volume_histogram(

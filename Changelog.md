@@ -193,3 +193,9 @@
 - Updated docs to match implemented reality (V1 base backtesting exists; overlays are env-gated).
 - Stopped tracking local OHLCV cache DB and ignored SQLite WAL/SHM + runtime logs to keep `git status` clean after running the app.
 - Added a minimal strategy overlay renderer smoke test to prevent paint-path regressions.
+
+## 0.8.5
+- Improved zoomed-out smoothness at 5k-20k visible bars by adding an indicator "preview compute" mode (downsampled recompute on idle instead of forced full-window recompute).
+- Reduced indicator render overhead by caching/reusing shared `times` arrays and adding dynamic per-pane indicator render LOD (max points + band fill disable when heavily zoomed out).
+- Stabilized volume histogram chunk caching by rendering chunks in normalized Y and applying a painter transform, so y-scale changes no longer trigger full chunk rebuilds.
+- Added an offline unittest to guard volume histogram cache stability across y-range changes.
